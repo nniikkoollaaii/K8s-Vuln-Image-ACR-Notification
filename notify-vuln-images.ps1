@@ -6,6 +6,17 @@
 # .\notify-vuln-images.ps1
 
 
+$[double]global:minimumCVEScore=8.0
+$global:adminReportEmails="admin@test.com;admin2@test.com"
+
+
+$global:namespaces = @{}
+$global:all_images = @{}
+$global:namespace_to_contact_email = @{}
+$global:namespace_to_imageList = @{}
+$global:image_to_digest = @{}
+$global:digest_to_vulnResult = @{}
+$global:contact_email_to_namespaceList = @{}
 
 
 function Main {
@@ -16,64 +27,24 @@ function Main {
     # Get all namespaces
     ######################################################
     Write-Host "|- Get all namespaces"
-    #$namespaces = $(kubectl get ns -o jsonpath="{.items[*].metadata.name}").Split(" ") | Get-Unique
-    $namespaces = "devops"
+    $global:namespaces = (Get-NamespacesMock)
 
 
 
     ######################################################
     # Get all images in all namespaces
     ######################################################
-    $all_images = @{}
-    $namespace_to_contact_email = @{}
-    $namespace_to_imageList = @{}
-    $image_to_digest = @{}
-    $digest_to_vulnResult = @{}
-
-    foreach ($namespace in $namespaces) {
-        Write-Host "|-|- Check Namespace '$namespace'"
-
-            
-        [string]$contact = $(kubectl get ns $namespace -o jsonpath="{.metadata.annotations.contact-email-address}")
-        $namespace_to_contact_email["$namespace"] = $contact
-        Write-Host "|-|-|- Contact-Email-Address for this Namespace is '$contact'"
-
-
-        $namespace_to_imageList["$namespace"] = New-Object Collections.Generic.List[string]
-        $images_in_this_namespace = $(kubectl get pods -n $namespace -o jsonpath="{.items[*].spec.containers[*].image}").Split(" ") | Get-Unique
-        foreach ($image in $images_in_this_namespace) {
-            $all_images["$image"] = {}
-            $namespace_to_imageList["$namespace"].Add($image)
-            Write-Host "|-|-|- Add Image '$image' to global list"
-        }
-
-    }
-
-
-    # Create contact_email_to_namespaceList
-    $contact_email_to_namespaceList = @{}
-    foreach ($entry in $namespace_to_contact_email.GetEnumerator()) {
-        if ($contact_email_to_namespaceList.ContainsKey($entry.Value)) {
-            $contact_email_to_namespaceList[$entry.Value].Add($entry.Key)
-        }
-        else {
-            $contact_email_to_namespaceList[$entry.Value] = New-Object Collections.Generic.List[string]
-            $contact_email_to_namespaceList[$entry.Value].Add($entry.Key)
-        }
-    }
+    Collect-NamespaceDataMock
 
     Write-Host "|- Found all images ..."
     Write-Host "|-"
     Write-Host "|- Starting to fetch Vuln-Info from Azure Graph"
 
-
-
     ######################################################
     # Iterate all images and get Vuln infos
     ######################################################
 
-
-    foreach ($image in $all_images.Keys) {
+    foreach ($image in $global:all_images.Keys) {
 
         
         Write-Host "|-|- Analyze Image '$image'"
@@ -97,15 +68,16 @@ function Main {
                 $registry = $Matches.1
                 $repo = $Matches.2
                 $tag = $Matches.3
-                $digest = $(Get-DigestForTag -Registry $registry -Repo $repo -Tag $tag)
+                $digest = $(Get-DigestForTagMock -Registry $registry -Repo $repo -Tag $tag)
             }
             else {
                 # ToDo
+                Write-Host "ERROR: Image '$image' does not match the regex '$regexRegistryAndRepoAndTag' to split into registry, repo and tag!"
             }
         }
 
         Write-Host "|-|-|- Digest: '$digest'"
-        $image_to_digest["$image"] = $digest
+        $global:image_to_digest["$image"] = $digest
 
 
 
@@ -113,32 +85,41 @@ function Main {
         $regexRegistryNameFromImage = "^(.*)\.azurecr\.io\/(.*)$"
         $regexResultRegistry = $image -match $regexRegistryNameFromImage
         $registryName = $Matches.1
-        $digest_to_vulnResult["$digest"] = (Get-VulnForImage -Registry "$registryName.azurecr.io" -Digest $digest)
+        $global:digest_to_vulnResult["$digest"] = (Get-VulnForImageMock -Registry "$registryName.azurecr.io" -Digest $digest)
 
-
-
-
-        ########################
-        # Create Reports
-        $adminReportContent = ""
-        foreach ($contactEmail in $contact_email_to_namespaceList.Keys) {
-            Write-Host "|-"
-            $tmp = (Create-HTMLReportContentForContactEmail -ContactEmail $contactEmail)
-            $adminReportContent += $tmp
-            #Send-UserReport
-
-            #Write-Host $tmp
-        }
-        Send-AdminReport -Content $adminReportContent
 
     }
-}
 
-function Send-AdminReport {
+
+    ########################
+    # Create Reports
+    $adminReportContent = ""
+    foreach ($contactEmail in $global:contact_email_to_namespaceList.Keys) {
+        Write-Host "|-"
+        $tmp = (Create-HTMLReportContentForContactEmail -ContactEmail $contactEmail)
+        $adminReportContent += $tmp
+
+        Send-UserReport -Content $tmp -Email $contactEmail
+
+        #Write-Host $tmp
+    }
+
+    
+
+    Write-Host "|- "
+    foreach ($adminEmail in (($global:adminReportEmails) -split ";")) {
+        Write-Host "|- Sending Admin report to $adminEmail"
+        Send-AdminReport -Content $adminReportContent -Email $adminEmail
+    }
+
+}
+function Send-UserReport {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)]
-        [string]$Content
+        [string]$Content,
+        [Parameter(Mandatory)]
+        [string]$Email
     )
 
     $htmlEmail = ""
@@ -147,12 +128,51 @@ function Send-AdminReport {
     $htmlEmail += @"
 <html>
 "@
-    $htmlEmail += $emailHTMLHeader
+    $htmlEmail += $((Get-Content -Path ./templates/emailHTMLHeader.html) -join "`n")
     $htmlEmail += @"
+
 <body>
+
 "@
-    $htmlEmail += $emailAdminPrefix
+    $htmlEmail += $((Get-Content -Path ./templates/emailUserPrefix.html) -join "`n")
     $htmlEmail += $Content
+    $htmlEmail += $((Get-Content -Path ./templates/emailUserSuffix.html) -join "`n")
+
+    $htmlEmail += @"
+</body>
+"@
+    $htmlEmail += @"
+</html>
+"@
+
+    Write-Host "|- Sending User report to $Email"
+    $htmlEmail | Out-File -FilePath "./user-report-$Email.html"
+
+}
+function Send-AdminReport {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Content,
+        [Parameter(Mandatory)]
+        [string]$Email
+    )
+
+    $htmlEmail = ""
+
+
+    $htmlEmail += @"
+<html>
+"@
+    $htmlEmail += $((Get-Content -Path ./templates/emailHTMLHeader.html) -join "`n")
+    $htmlEmail += @"
+
+<body>
+
+"@
+    $htmlEmail += $((Get-Content -Path ./templates/emailAdminPrefix.html) -join "`n")
+    $htmlEmail += $Content
+    $htmlEmail += $((Get-Content -Path ./templates/emailAdminSuffix.html) -join "`n")
 
     $htmlEmail += @"
 </body>
@@ -163,8 +183,9 @@ function Send-AdminReport {
 
     $htmlEmail | Out-File -FilePath "./admin-report.html"
 
-
 }
+
+
 
 function Create-HTMLReportContentForContactEmail {
     [CmdletBinding()]
@@ -176,64 +197,87 @@ function Create-HTMLReportContentForContactEmail {
 
     Write-Host "|- Generating HTML report for Contact-Email $ContactEmail ..."
     [string]$content = ""
-    $listOfNamespacesForThisContactEmail = $contact_email_to_namespaceList[$ContactEmail]
+    $listOfNamespacesForThisContactEmail = $global:contact_email_to_namespaceList[$ContactEmail]
     foreach ($namespace in $listOfNamespacesForThisContactEmail) {
-        $imagesInThisNamespace = $namespace_to_imageList[$namespace]
+        $imagesInThisNamespace = $global:namespace_to_imageList[$namespace]
+
+        $content += @"
+
+
+
+
+        
+    <h2>Namespace "$namespace"</h2>
+"@
+
+        
         foreach ($image in $imagesInThisNamespace) {
-            $digestForThisImage = $image_to_digest[$image]
-            $vulnReportForThisImage = $digest_to_vulnResult[$digestForThisImage]
+            $digestForThisImage = $global:image_to_digest["$image"]
+            $vulnReportForThisImage = $global:digest_to_vulnResult["$digestForThisImage"]
 
             $content += @"
-<b>$image</b><br>(Digest: $digestForThisImage)
-<br>
-<table>
-    <tr>
-        <th>Severity</th>
-        <th>CVEScore3</th>
-        <th>Category</th>
-        <th>Name</th>
-        <th>Description</th>
-        <th>Impact</th>
-        <th>CVEs</th>
-    </tr>
-
+    
+    <p>
+        <b>Image "$image"</b>
+        <br>
+        (Digest: $digestForThisImage)
+        <br>
+        <table>
+            <tr>
+                <th>Severity</th>
+                <th>CVEScore3</th>
+                <th>Category</th>
+                <th>Name</th>
+                <th>Description</th>
+                <th>Impact</th>
+                <th>CVEs</th>
+            </tr>
 "@
             
             foreach ($finding in  $vulnReportForThisImage) {
 
                 $content += @"
-    <tr>
-        <td>$($finding.Severity)</td>
-        <td>$($finding.CVEScore3)</td>
-        <td>$($finding.Category)</td>
-        <td>$($finding.Name)</td>
-        <td>$($finding.Description)</td>
-        <td>$($finding.Impact)</td>
-        <td>
+            
+            <tr>
+                <td>$($finding.Severity)</td>
+                <td>$($finding.CVEScore3)</td>
+                <td>$($finding.Category)</td>
+                <td>$($finding.Name)</td>
+                <td>$($finding.Description)</td>
+                <td>$($finding.Impact)</td>
+                <td>
 
 "@
 
                 foreach ($cve in $($finding.CVEs)) {
                     $content += @"
-                <a href="$($cve.URL)">$($cve.Id)</a>
+                        <a href="$($cve.URL)">$($cve.Id)</a>
 
 "@
                 }
 
                 $content += @"
-        </td>
+                </td>
 
 "@               
                 $content += @"
-    </tr>
-
+            </tr>
 "@
             }
+            
+        $content += @"
+
+        </table>
+    </p>
+    <br>
+"@
         }
 
 
         $content += @"
-</table>
+
+    <br>
+
 "@
 
     }
@@ -317,6 +361,65 @@ securityresources  | where type =~ "microsoft.security/assessments/subassessment
     return $vulnScanResult
 }
 
+function Get-VulnForImageMock {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Registry,
+        [Parameter(Mandatory)]
+        [string]$Digest
+    )
+
+    [System.Collections.Generic.List[VulnScanResultFinding]]$vulnScanResult = @()
+
+    $tmp1 = [VulnScanResultFinding] @{ 
+        Severity    = "High"
+        CVEScore3   = "8,5"
+        Category    = ""
+        Name        = "Vuln 1"
+        Description = ""
+        Impact      = ""
+        CVEs        = @([CVE]@{
+            Id  = "CVE-123"
+            URL = "https://test.com"
+        },
+        [CVE]@{
+            Id  = "CVE-321"
+            URL = "https://test.com"
+        })
+        Digest      = "11111111"
+    }
+
+    $vulnScanResult.Add($tmp1)
+
+
+
+
+    $tmp2 = [VulnScanResultFinding] @{ 
+        Severity    = "Low"
+        CVEScore3   = "6"
+        Category    = ""
+        Name        = "Vuln 2"
+        Description = ""
+        Impact      = ""
+        CVEs        = @([CVE]@{
+            Id  = "CVE-456"
+            URL = "https://test.com"
+        },
+        [CVE]@{
+            Id  = "CVE-654"
+            URL = "https://test.com"
+        })
+        Digest      = "111111"
+    }
+    
+    $vulnScanResult.Add($tmp2)
+
+    Write-Host "|-|-|- $($vulnScanResult.Count) findings"
+    
+    return $vulnScanResult
+}
+
 class VulnScanResultFinding {
     [string] $Severity
     [string] $CVEScore3
@@ -370,53 +473,94 @@ function Get-DigestForTag {
     Write-Output $digest
 }
 
-$emailHTMLHeader = @"
-<head>
-<style>
-table {
-  font-family: arial, sans-serif;
-  border-collapse: collapse;
-  width: 100%;
+function Get-DigestForTagMock {
+    [CmdletBinding()]
+    param( 
+        [Parameter(Mandatory)]
+        [string]$Registry,
+        [Parameter(Mandatory)]
+        [string]$Repo,
+        [Parameter(Mandatory)]
+        [string]$Tag
+    ) 
+
+    Write-Output "123456789"
 }
 
-td, th {
-  border: 1px solid #dddddd;
-  text-align: left;
-  padding: 8px;
+
+
+function Get-Namespaces {
+    $global:namespaces = $(kubectl get ns -o jsonpath="{.items[*].metadata.name}").Split(" ") | Get-Unique
 }
-</style>
-</head>
-"@
+function Get-NamespacesMock {
+    $global:namespaces = "devops"
+}
 
-$emailAdminPrefix = @"
-<p>
-Die folgenden Container Images in Namespaces haben Vulnerabilities:
-</p>
-<br>
-"@
 
-$emailUserPrefix = @"
-<p>
-Hallo,
-</p>
-<p>
-die folgenden Container Images in Namespaces mit dieser Kontakt-Email-Adresse haben Vulnerabilities:
-</p>
-<br>
-"@
 
-$emailUserSuffix = @"
-<br>
-<p>
-Hintergrund:
-</p>
-<p>
-Dies ist eine unterstützende Information zur Einhaltung von IT-Security Richtlinie B XY.ToDo
-</p>
-<p>
-Mit freundlichen Grüßen<br>
-Euer AKS Platform Team
-</p>
-"@
+function Collect-NamespaceData {
+    
+    foreach ($namespace in $global:namespaces) {
+        Write-Host "|-|- Check Namespace '$namespace'"
+
+            
+        [string]$contact = $(kubectl get ns $namespace -o jsonpath="{.metadata.annotations.contact-email-address}")
+        $global:namespace_to_contact_email["$namespace"] = $contact
+        Write-Host "|-|-|- Contact-Email-Address for this Namespace is '$contact'"
+
+
+        $global:namespace_to_imageList["$namespace"] = New-Object Collections.Generic.List[string]
+        $images_in_this_namespace = 
+            $(kubectl get pods -n $namespace -o jsonpath="{.items[*].spec.containers[*].image}").Split(" ") | Get-Unique
+            +
+            $(kubectl get pods -n $namespace -o jsonpath="{.items[*].spec.initcontainers[*].image}").Split(" ") | Get-Unique
+        
+            foreach ($image in $images_in_this_namespace) {
+            $global:all_images["$image"] = {}
+            $global:namespace_to_imageList["$namespace"].Add($image)
+            Write-Host "|-|-|- Add Image '$image' to global list"
+        }
+
+    }
+
+    # Create contact_email_to_namespaceList
+    $global:contact_email_to_namespaceList = @{}
+    foreach ($entry in $global:namespace_to_contact_email.GetEnumerator()) {
+
+        foreach ($email in ($entry -split ";")) {
+            if ($global:contact_email_to_namespaceList.ContainsKey($entry.Value)) {
+                $global:contact_email_to_namespaceList[$entry.Value].Add($entry.Key)
+            }
+            else {
+                $global:contact_email_to_namespaceList[$entry.Value] = New-Object Collections.Generic.List[string]
+                $global:contact_email_to_namespaceList[$entry.Value].Add($entry.Key)
+            }
+        }
+
+
+    }
+
+}
+function Collect-NamespaceDataMock {
+    $global:namespace_to_contact_email["ns1"] = "test1aaa@abc.com;test1bbb@abc.com"
+    $global:namespace_to_imageList["ns1"] = New-Object Collections.Generic.List[string]
+    $global:namespace_to_imageList["ns1"].Add("myregistry.azurecr.io/ns1/image:1.0.0")
+    $global:all_images["myregistry.azurecr.io/ns1/image:1.0.0"] = {}
+    $global:contact_email_to_namespaceList["test1aaa@abc.com"] = New-Object Collections.Generic.List[string]
+    $global:contact_email_to_namespaceList["test1aaa@abc.com"].Add("ns1")
+    $global:contact_email_to_namespaceList["test1bbb@abc.com"] = New-Object Collections.Generic.List[string]
+    $global:contact_email_to_namespaceList["test1bbb@abc.com"].Add("ns1")
+
+    
+    $global:namespace_to_contact_email["ns2"] = "test2@abc.com"
+    $global:namespace_to_imageList["ns2"] = New-Object Collections.Generic.List[string]
+    $global:namespace_to_imageList["ns2"].Add("myregistry.azurecr.io/ns2/image1:1.0.0")
+    $global:all_images["myregistry.azurecr.io/ns2/image1:1.0.0"] = {}
+    $global:namespace_to_imageList["ns2"].Add("myregistry.azurecr.io/ns2/image2:1.0.0")
+    $global:all_images["myregistry.azurecr.io/ns2/image2:1.0.0"] = {}
+    $global:contact_email_to_namespaceList["test2@abc.com"] = New-Object Collections.Generic.List[string]
+    $global:contact_email_to_namespaceList["test2@abc.com"].Add("ns2")
+}
+
 
 Main
