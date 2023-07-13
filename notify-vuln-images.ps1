@@ -6,7 +6,7 @@
 # .\notify-vuln-images.ps1
 
 
-$[double]global:minimumCVEScore=8.0
+#$global:minimumCVEScore=8.0
 $global:adminReportEmails="admin@test.com;admin2@test.com"
 
 
@@ -27,7 +27,7 @@ function Main {
     # Get all namespaces
     ######################################################
     Write-Host "|- Get all namespaces"
-    $global:namespaces = (Get-NamespacesMock)
+    Get-NamespacesMock
 
 
 
@@ -47,19 +47,25 @@ function Main {
     foreach ($image in $global:all_images.Keys) {
 
         
-        Write-Host "|-|- Analyze Image '$image'"
+        Write-Host "|-|- Analyzing Image '$image'"
 
+
+        #####
+        # First step: Get Container Image digest 
+        $digest = ""
+
+        #####
+        # Check if the container image digest is specifed in the Pod specification directly like "myregistry.azurecr.io/ns2/image1:1.0.0@sha256:12345678987654321"
         #https://regex101.com/library/eK9lPd?filterFlavors=pcre&filterFlavors=javascript&page=22
         $regexDigest = "@(sha256:[0-9A-Fa-f]{32,})"
 
-        $digest = ""
-
-        $resultDigest = $image -match $regexDigest
-        if ($resultDigest) {
+        $resultRegexDigest = $image -match $regexDigest
+        if ($resultRegexDigest) {
+            # Found digest in pod spec
             $digest = $Matches.1
         }
         else {
-            
+            # If not found in pod spec query Azure Container Registry to get latest digest for the tag
             Write-Host "|-|-|- Find digest for image '$image'"
             
             $regexRegistryAndRepoAndTag = "^(.*?)\/(.*):(.*)$"
@@ -81,38 +87,78 @@ function Main {
 
 
 
-
+        ######
+        # Second step: Get vuln information for the image
         $regexRegistryNameFromImage = "^(.*)\.azurecr\.io\/(.*)$"
         $regexResultRegistry = $image -match $regexRegistryNameFromImage
         $registryName = $Matches.1
         $global:digest_to_vulnResult["$digest"] = (Get-VulnForImageMock -Registry "$registryName.azurecr.io" -Digest $digest)
 
-
     }
 
 
-    ########################
+    ######################################################
     # Create Reports
-    $adminReportContent = ""
+    ######################################################
+    New-Item -ItemType Directory -Force -Path reports | Out-Null
+
+    ### User Reports
     foreach ($contactEmail in $global:contact_email_to_namespaceList.Keys) {
         Write-Host "|-"
-        $tmp = (Create-HTMLReportContentForContactEmail -ContactEmail $contactEmail)
-        $adminReportContent += $tmp
 
-        Send-UserReport -Content $tmp -Email $contactEmail
+        Write-Host "|- Generating HTML report for Contact-Email $contactEmail ..."
 
-        #Write-Host $tmp
-    }
-
+        $userReportContent=""
+        $userReportContent += @"
     
 
+
+
+"@
+        $listOfNamespacesForThisContactEmail = $global:contact_email_to_namespaceList[$contactEmail]
+        foreach ($namespace in $listOfNamespacesForThisContactEmail) {
+            $userReportContent += (Create-HTMLReportContentForNamespace -Namespace $namespace)
+            $userReportContent += @"
+        
+    
+    
+    
+"@
+        }
+    
+        Send-UserReport -Content $userReportContent -Email $contactEmail
+        
+    }
+    
+
+    
+    ### Admin Report
     Write-Host "|- "
+    $adminReportContent = ""
+    $adminReportContent += @"
+    
+
+
+        
+"@
+    foreach ($namespace in $global:namespaces) {
+        $adminReportContent += (Create-HTMLReportContentForNamespace -Namespace $namespace)
+        $adminReportContent += @"
+    
+
+
+
+"@
+    }
+
     foreach ($adminEmail in (($global:adminReportEmails) -split ";")) {
         Write-Host "|- Sending Admin report to $adminEmail"
         Send-AdminReport -Content $adminReportContent -Email $adminEmail
     }
 
 }
+
+
 function Send-UserReport {
     [CmdletBinding()]
     param (
@@ -146,7 +192,7 @@ function Send-UserReport {
 "@
 
     Write-Host "|- Sending User report to $Email"
-    $htmlEmail | Out-File -FilePath "./user-report-$Email.html"
+    $htmlEmail | Out-File -FilePath "./reports/user-report-$Email.html"
 
 }
 function Send-AdminReport {
@@ -181,7 +227,7 @@ function Send-AdminReport {
 </html>
 "@
 
-    $htmlEmail | Out-File -FilePath "./admin-report.html"
+    $htmlEmail | Out-File -FilePath "./reports/admin-report-$Email.html"
 
 }
 
@@ -281,6 +327,102 @@ function Create-HTMLReportContentForContactEmail {
 "@
 
     }
+
+
+    Write-Output $content
+}
+
+function Create-HTMLReportContentForNamespace {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Namespace
+    )
+
+
+    Write-Host "|- Generating HTML report for Namespace $Namespace ..."
+    [string]$content = ""
+    $imagesInThisNamespace = $global:namespace_to_imageList[$namespace]
+
+    $content += @"
+    <h2>Namespace "$namespace"</h2>
+"@
+
+        
+    foreach ($image in $imagesInThisNamespace) {
+        $digestForThisImage = $global:image_to_digest["$image"]
+        $vulnReportForThisImage = $global:digest_to_vulnResult["$digestForThisImage"]
+
+        $content += @"
+    
+    <p>
+        <b>Image "$image"</b>
+        <br>
+        (Digest: $digestForThisImage)
+        <br>
+        <table>
+            <tr>
+                <th>Severity</th>
+                <th>CVEScore3</th>
+                <th>Category</th>
+                <th>Name</th>
+                <th>Description</th>
+                <th>Impact</th>
+                <th>CVEs</th>
+            </tr>
+"@
+            
+        foreach ($finding in  $vulnReportForThisImage) {
+
+
+            # if ($finding.CVEScore3 < $global:minimumCVEScore) {
+            #     continue
+            # }
+
+
+            $content += @"
+            
+            <tr>
+                <td>$($finding.Severity)</td>
+                <td>$($finding.CVEScore3)</td>
+                <td>$($finding.Category)</td>
+                <td>$($finding.Name)</td>
+                <td>$($finding.Description)</td>
+                <td>$($finding.Impact)</td>
+                <td>
+
+"@
+
+            foreach ($cve in $($finding.CVEs)) {
+                $content += @"
+                        <a href="$($cve.URL)">$($cve.Id)</a>
+
+"@
+            }
+
+            $content += @"
+                </td>
+
+"@               
+            $content += @"
+            </tr>
+"@
+        }
+            
+    $content += @"
+
+        </table>
+    </p>
+    <br>
+"@
+        }
+
+
+    $content += @"
+
+    <br>
+"@
+
 
 
     Write-Output $content
@@ -493,7 +635,7 @@ function Get-Namespaces {
     $global:namespaces = $(kubectl get ns -o jsonpath="{.items[*].metadata.name}").Split(" ") | Get-Unique
 }
 function Get-NamespacesMock {
-    $global:namespaces = "devops"
+    $global:namespaces = @("ns1", "ns2")
 }
 
 
